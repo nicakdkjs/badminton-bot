@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 
 from telegram import (
     InlineKeyboardButton,
@@ -17,8 +18,16 @@ from telegram.request import HTTPXRequest
 
 TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = "badminton.db"
+pending_removals = {}
+REMOVE_CONFIRM_SECONDS = 5
 
+ADMIN_IDS = {
+    230080320,   # you
+    307215246,   # admin 1
+}
 
+def is_bot_admin(user_id):
+    return user_id in ADMIN_IDS
 # =========================================================
 # DATABASE
 # =========================================================
@@ -46,11 +55,12 @@ def setup_database():
             shuttle TEXT NOT NULL,
             max_players INTEGER NOT NULL,
             chat_id INTEGER,
-            message_id INTEGER
+            message_id INTEGER,
+            finished INTEGER NOT NULL DEFAULT 0
         )
         """
     )
-
+    
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS entries (
@@ -63,6 +73,27 @@ def setup_database():
             guest_number INTEGER,
             status TEXT NOT NULL,
             position INTEGER NOT NULL,
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS charges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            owner_name TEXT NOT NULL,
+            entry_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unpaid',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            paid_at TEXT,
+
             FOREIGN KEY (game_id)
                 REFERENCES games(id)
                 ON DELETE CASCADE
@@ -187,13 +218,45 @@ def make_keyboard(game_id):
                     callback_data=f"remove_me:{game_id}",
                 ),
                 InlineKeyboardButton(
-                    "➖ Remove +1",
+                    "👥 Remove +1",
                     callback_data=f"remove_guest:{game_id}",
                 ),
             ],
         ]
     )
+    
+    
+def make_finish_game_keyboard(games):
+    buttons = []
 
+    for game in games:
+        label = (
+            f"🏸 {game['date']} • "
+            f"{game['time']} • "
+            f"${game['price']}"
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=(
+                        f"finish_confirm:{game['id']}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="finish_cancel",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
 
 def make_game_text(game, players, waitlist):
     if players:
@@ -233,7 +296,74 @@ def make_game_text(game, players, waitlist):
         f"{waitlist_text}"
     )
 
+def make_debts_keyboard(people):
+    buttons = []
 
+    for owner_id, person in people.items():
+        total = sum(
+            charge["amount"]
+            for charge in person["charges"]
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Pay all — {person['name']} (${total:.2f})",
+                    callback_data=f"payall:{owner_id}",
+                )
+            ]
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"📅 Pay specific game — {person['name']}",
+                    callback_data=f"paychoose:{owner_id}",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(buttons)
+    
+def make_specific_payment_keyboard(owner_id, charges):
+    by_game = {}
+
+    for charge in charges:
+        game_id = charge["game_id"]
+
+        if game_id not in by_game:
+            by_game[game_id] = {
+                "date": charge["date"],
+                "total": 0,
+            }
+
+        by_game[game_id]["total"] += charge["amount"]
+
+    buttons = []
+
+    for game_id, item in by_game.items():
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{item['date']} — ${item['total']:.2f}",
+                    callback_data=(
+                        f"paygame:{owner_id}:{game_id}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="pay_cancel",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+    
 # =========================================================
 # WAITLIST
 # =========================================================
@@ -376,10 +506,10 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     await update.message.reply_text(
         "🏸 Baddy Buddies bot is online!"
     )
-
 
 async def create_game(
     update: Update,
@@ -475,7 +605,529 @@ async def create_game(
     conn.commit()
     conn.close()
 
+async def finish_game_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "❌ You are not authorised to use /finishgame."
+        )
+        return
 
+    conn = get_db()
+    
+    games = conn.execute(
+        """
+        SELECT *
+        FROM games
+        WHERE finished = 0
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not games:
+        await update.message.reply_text(
+            "There are no unfinished games."
+        )
+        return
+
+    await update.message.reply_text(
+        "🏸 Choose a game to finish:",
+        reply_markup=make_finish_game_keyboard(
+            games
+        ),
+    )
+    
+async def balance_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT
+            charges.*,
+            games.date
+        FROM charges
+        JOIN games
+            ON games.id = charges.game_id
+        WHERE charges.owner_id = ?
+          AND charges.status != 'paid'
+        ORDER BY games.id ASC, charges.id ASC
+        """,
+        (user.id,),
+    ).fetchall()
+
+    conn.close()
+
+    if not charges:
+        await update.message.reply_text(
+            "✅ You have no outstanding payments!"
+        )
+        return
+
+    lines = [
+        f"💰 {user.full_name}",
+        "",
+        "Outstanding:",
+        "",
+    ]
+
+    total = 0
+
+    for charge in charges:
+        amount = charge["amount"]
+        total += amount
+
+        # Normal player
+        if charge["entry_name"] == charge["owner_name"]:
+            lines.append(
+                f"• {charge['date']} — "
+                f"${amount:.2f}"
+            )
+
+        # +1
+        else:
+            lines.append(
+                f"• {charge['date']} "
+                f"({charge['entry_name']}) — "
+                f"${amount:.2f}"
+            )
+
+    lines.extend(
+        [
+            "",
+            f"Total: ${total:.2f}",
+        ]
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+    
+
+async def finish_game_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised to finish games.",
+            show_alert=True,
+        )
+        return
+
+    if query.data == "finish_cancel":
+        await query.answer()
+
+        await query.edit_message_text(
+            "❌ Finish game cancelled."
+        )
+        return
+
+    _, game_id_text = query.data.split(":")
+    game_id = int(game_id_text)
+
+    game = get_game(game_id)
+
+    if game is None:
+        await query.answer(
+            "Game not found.",
+            show_alert=True,
+        )
+        return
+
+    if game["finished"]:
+        await query.answer(
+            "This game has already been finished.",
+            show_alert=True,
+        )
+        return
+
+    players = get_players(game_id)
+
+    if not players:
+        await query.answer(
+            "This game has no players.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        price = float(game["price"])
+    except ValueError:
+        await query.answer(
+            "This game's price is invalid.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    for player in players:
+        conn.execute(
+            """
+            INSERT INTO charges (
+                game_id,
+                owner_id,
+                owner_name,
+                entry_name,
+                amount,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, 'unpaid')
+            """,
+            (
+                game_id,
+                player["owner_id"],
+                player["owner_name"],
+                player["name"],
+                price,
+            ),
+        )
+
+    conn.execute(
+        """
+        UPDATE games
+        SET finished = 1
+        WHERE id = ?
+        """,
+        (game_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+    total = price * len(players)
+
+    await query.answer()
+
+    await query.edit_message_text(
+        f"✅ Game finished!\n\n"
+        f"📅 {game['date']}\n"
+        f"👥 {len(players)} players\n"
+        f"💰 ${price:.2f}/pax\n"
+        f"🧾 ${total:.2f} total charges created"
+    )
+    
+async def debts_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "❌ You are not authorised to manage payments."
+        )
+        return
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT
+            charges.*,
+            games.date
+        FROM charges
+        JOIN games
+            ON games.id = charges.game_id
+        WHERE charges.status != 'paid'
+        ORDER BY
+            charges.owner_name,
+            games.id,
+            charges.id
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not charges:
+        await update.message.reply_text(
+            "✅ Everyone has paid!"
+        )
+        return
+
+    people = {}
+
+    for charge in charges:
+        owner_id = charge["owner_id"]
+
+        if owner_id not in people:
+            people[owner_id] = {
+                "name": charge["owner_name"],
+                "charges": [],
+            }
+
+        people[owner_id]["charges"].append(
+            charge
+        )
+
+    lines = [
+        "💰 Outstanding Payments",
+        "",
+    ]
+
+    for person in people.values():
+        lines.append(
+            f"{person['name']}:"
+        )
+
+        total = 0
+
+        for charge in person["charges"]:
+            amount = charge["amount"]
+            total += amount
+
+            if (
+                charge["entry_name"]
+                == charge["owner_name"]
+            ):
+                description = charge["date"]
+            else:
+                description = (
+                    f"{charge['date']} "
+                    f"({charge['entry_name']})"
+                )
+
+            lines.append(
+                f"• {description} — "
+                f"${amount:.2f}"
+            )
+
+        lines.append(
+            f"Total: ${total:.2f}"
+        )
+        lines.append("")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=make_debts_keyboard(people),
+    )
+    
+async def pay_all_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised to manage payments.",
+            show_alert=True,
+        )
+        return
+
+    _, owner_id_text = query.data.split(":")
+    owner_id = int(owner_id_text)
+
+    conn = get_db()
+
+    person = conn.execute(
+        """
+        SELECT
+            owner_name,
+            COALESCE(SUM(amount), 0) AS total
+        FROM charges
+        WHERE owner_id = ?
+          AND status = 'unpaid'
+        """,
+        (owner_id,),
+    ).fetchone()
+
+    if (
+        person is None
+        or person["total"] == 0
+    ):
+        conn.close()
+
+        await query.answer(
+            "No outstanding balance.",
+            show_alert=True,
+        )
+        return
+
+    name = person["owner_name"]
+    total = person["total"]
+
+    conn.execute(
+        """
+        UPDATE charges
+        SET status = 'paid',
+            paid_at = CURRENT_TIMESTAMP
+        WHERE owner_id = ?
+          AND status = 'unpaid'
+        """,
+        (owner_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await query.answer()
+
+    await query.edit_message_text(
+        f"✅ Payment recorded\n\n"
+        f"{name}\n"
+        f"Paid all outstanding: ${total:.2f}"
+    )
+    
+async def pay_choose_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised to manage payments.",
+            show_alert=True,
+        )
+        return
+
+    _, owner_id_text = query.data.split(":")
+    owner_id = int(owner_id_text)
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT
+            charges.*,
+            games.date
+        FROM charges
+        JOIN games
+            ON games.id = charges.game_id
+        WHERE charges.owner_id = ?
+          AND charges.status = 'unpaid'
+        ORDER BY games.id ASC
+        """,
+        (owner_id,),
+    ).fetchall()
+
+    conn.close()
+
+    if not charges:
+        await query.answer(
+            "No outstanding games.",
+            show_alert=True,
+        )
+        return
+
+    name = charges[0]["owner_name"]
+
+    await query.answer()
+
+    await query.edit_message_text(
+        f"📅 Choose which game {name} paid:",
+        reply_markup=make_specific_payment_keyboard(
+            owner_id,
+            charges,
+        ),
+    )
+    
+async def pay_game_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised to manage payments.",
+            show_alert=True,
+        )
+        return
+
+    _, owner_id_text, game_id_text = query.data.split(":")
+
+    owner_id = int(owner_id_text)
+    game_id = int(game_id_text)
+
+    conn = get_db()
+
+    info = conn.execute(
+        """
+        SELECT
+            charges.owner_name,
+            games.date,
+            COALESCE(SUM(charges.amount), 0) AS total
+        FROM charges
+        JOIN games
+            ON games.id = charges.game_id
+        WHERE charges.owner_id = ?
+          AND charges.game_id = ?
+          AND charges.status = 'unpaid'
+        """,
+        (
+            owner_id,
+            game_id,
+        ),
+    ).fetchone()
+
+    if (
+        info is None
+        or info["total"] == 0
+    ):
+        conn.close()
+
+        await query.answer(
+            "This payment is already settled.",
+            show_alert=True,
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE charges
+        SET status = 'paid',
+            paid_at = CURRENT_TIMESTAMP
+        WHERE owner_id = ?
+          AND game_id = ?
+          AND status = 'unpaid'
+        """,
+        (
+            owner_id,
+            game_id,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await query.answer()
+
+    await query.edit_message_text(
+        f"✅ Payment recorded\n\n"
+        f"{info['owner_name']}\n"
+        f"{info['date']} — ${info['total']:.2f}"
+    )
+    
+async def pay_cancel_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised to manage payments.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    await query.edit_message_text(
+        "❌ Payment update cancelled."
+    )
+       
 # =========================================================
 # BUTTON HANDLER
 # =========================================================
@@ -494,6 +1146,13 @@ async def button_handler(
     if game is None:
         await query.answer(
             "This game no longer exists.",
+            show_alert=True,
+        )
+        return
+
+    if game["finished"]:
+        await query.answer(
+            "🔒 This game has already finished.",
             show_alert=True,
         )
         return
@@ -666,6 +1325,35 @@ async def button_handler(
     # -----------------------------------------------------
 
     elif action == "remove_me":
+
+        confirm_key = (
+            user_id,
+            game_id,
+            "remove_me",
+        )
+
+        now = time.time()
+        previous = pending_removals.get(confirm_key)
+
+        if (
+            previous is None
+            or now - previous > REMOVE_CONFIRM_SECONDS
+        ):
+            pending_removals[confirm_key] = now
+
+            await query.answer(
+                "⚠️ Tap Remove me again within "
+                "5 seconds to confirm.",
+                show_alert=True,
+            )
+            return
+
+        # Second tap confirmed
+        pending_removals.pop(
+            confirm_key,
+            None,
+        )
+
         conn = get_db()
 
         entry = conn.execute(
@@ -722,14 +1410,42 @@ async def button_handler(
             )
 
         await query.answer(
-            "Removed your name."
+            "✅ You have been removed."
         )
-
     # -----------------------------------------------------
     # REMOVE +1
     # -----------------------------------------------------
 
     elif action == "remove_guest":
+
+        confirm_key = (
+            user_id,
+            game_id,
+            "remove_guest",
+        )
+
+        now = time.time()
+        previous = pending_removals.get(confirm_key)
+
+        if (
+            previous is None
+            or now - previous > REMOVE_CONFIRM_SECONDS
+        ):
+            pending_removals[confirm_key] = now
+
+            await query.answer(
+                "⚠️ Tap Remove +1 again within "
+                "5 seconds to confirm.",
+                show_alert=True,
+            )
+            return
+
+        # Second tap confirmed
+        pending_removals.pop(
+            confirm_key,
+            None,
+        )
+
         conn = get_db()
 
         guest = conn.execute(
@@ -787,7 +1503,7 @@ async def button_handler(
         )
 
         await query.answer(
-            "Removed one +1."
+            "✅ Your latest +1 has been removed."
         )
 
     # -----------------------------------------------------
@@ -798,15 +1514,17 @@ async def button_handler(
     players = get_players(game_id)
     waitlist = get_waitlist(game_id)
 
-    await query.edit_message_text(
-        make_game_text(
+    await context.bot.edit_message_text(
+        chat_id=game["chat_id"],
+        message_id=game["message_id"],
+        text=make_game_text(
             game,
             players,
             waitlist,
         ),
         reply_markup=make_keyboard(game_id),
     )
-
+    
     # -----------------------------------------------------
     # PING PROMOTED PLAYERS
     # -----------------------------------------------------
@@ -823,7 +1541,6 @@ async def button_handler(
             f"into the game!",
             parse_mode="HTML",
         )
-
 
 # =========================================================
 # MAIN
@@ -859,7 +1576,14 @@ def main():
             create_game,
         )
     )
-
+	
+    app.add_handler(
+        CallbackQueryHandler(
+            finish_game_button,
+            pattern=r"^(finish_confirm:\d+|finish_cancel)$",
+        )
+    )
+    
     app.add_handler(
         CallbackQueryHandler(
             button_handler,
@@ -868,6 +1592,56 @@ def main():
             ),
         )
     )
+    
+    app.add_handler(
+        CommandHandler(
+            "finishgame",
+            finish_game_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "balance",
+            balance_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "debts",
+            debts_command,
+        )
+    )
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            pay_all_button,
+            pattern=r"^payall:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            pay_choose_button,
+            pattern=r"^paychoose:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            pay_game_button,
+            pattern=r"^paygame:\d+:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            pay_cancel_button,
+            pattern=r"^pay_cancel$",
+        )
+    )
+    
 
     print("🏸 Baddy Buddies is running...")
 
