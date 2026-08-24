@@ -877,10 +877,10 @@ async def start(
                 update.effective_user.id
 	    ),
         )
-    else:
-        await update.message.reply_text(
-            "🏸 Baddy Buddies bot is online!"
-        )
+    #else:
+    #    await update.message.reply_text(
+    #        "🏸 Baddy Buddies bot is online!"
+    #    )
 
 async def create_game(
     update: Update,
