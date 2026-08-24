@@ -29,7 +29,7 @@ ADMIN_IDS = {
     307215246,   # admin 1
 }
 
-GAME_CHAT_ID = -5000854772
+GAME_CHAT_ID = -1003789443207
 
 CREATE_GAME_STEPS = [
     "max_players",
