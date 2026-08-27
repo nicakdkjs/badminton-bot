@@ -116,6 +116,43 @@ def setup_database():
         )
         """
     )
+    
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS credit_accounts (
+            owner_id INTEGER PRIMARY KEY,
+            owner_name TEXT NOT NULL,
+            balance_cents INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS credit_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            transaction_type TEXT NOT NULL,
+            game_id INTEGER,
+            description TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS topup_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            owner_name TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -210,7 +247,135 @@ def compact_positions(game_id, status):
     conn.commit()
     conn.close()
 
+LOW_CREDIT_THRESHOLD_CENTS = 2000  # $20
 
+
+def get_credit_balance(owner_id):
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT balance_cents
+        FROM credit_accounts
+        WHERE owner_id = ?
+        """,
+        (owner_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if row is None:
+        return 0
+
+    return row["balance_cents"]
+
+
+def add_credit(
+    owner_id,
+    owner_name,
+    amount_cents,
+    description="Top up",
+):
+    conn = get_db()
+
+    conn.execute(
+        """
+        INSERT INTO credit_accounts (
+            owner_id,
+            owner_name,
+            balance_cents
+        )
+        VALUES (?, ?, ?)
+
+        ON CONFLICT(owner_id)
+        DO UPDATE SET
+            owner_name = excluded.owner_name,
+            balance_cents =
+                credit_accounts.balance_cents
+                + excluded.balance_cents
+        """,
+        (
+            owner_id,
+            owner_name,
+            amount_cents,
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO credit_transactions (
+            owner_id,
+            amount_cents,
+            transaction_type,
+            description
+        )
+        VALUES (?, ?, 'topup', ?)
+        """,
+        (
+            owner_id,
+            amount_cents,
+            description,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def use_credit(
+    owner_id,
+    amount_cents,
+    game_id,
+):
+    balance = get_credit_balance(owner_id)
+
+    used = min(
+        balance,
+        amount_cents,
+    )
+
+    if used <= 0:
+        return 0
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE credit_accounts
+        SET balance_cents =
+            balance_cents - ?
+        WHERE owner_id = ?
+        """,
+        (
+            used,
+            owner_id,
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO credit_transactions (
+            owner_id,
+            amount_cents,
+            transaction_type,
+            game_id,
+            description
+        )
+        VALUES (?, ?, 'game', ?, ?)
+        """,
+        (
+            owner_id,
+            -used,
+            game_id,
+            f"Game #{game_id}",
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return used
+    
 # =========================================================
 # GAME DISPLAY
 # =========================================================
@@ -254,6 +419,12 @@ def make_main_menu(user_id):
             InlineKeyboardButton(
                 "🏸 Upcoming games",
                 callback_data="menu_games",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 My credits",
+                callback_data="menu_credit",
             )
         ],
     ]
@@ -857,6 +1028,34 @@ def make_edit_field_keyboard(game_id):
         ]
     )
     
+def make_topup_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "$20",
+                    callback_data="topup:2000",
+                ),
+                InlineKeyboardButton(
+                    "$50",
+                    callback_data="topup:5000",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "$100",
+                    callback_data="topup:10000",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="topup_cancel",
+                )
+            ],
+        ]
+    )
+    
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
@@ -1397,6 +1596,40 @@ async def menu_button(
             "🏸 Upcoming Games\n\nChoose a game:",
             reply_markup=make_upcoming_games_keyboard(games),
         )
+        
+        
+    if query.data == "menu_credit":
+        balance = get_credit_balance(
+            query.from_user.id
+        )
+
+        await query.answer()
+
+        await query.edit_message_text(
+            (
+                "💳 Baddy Buddies Credit\n\n"
+                f"Available credit: "
+                f"${balance / 100:.2f}"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "➕ Top up",
+                            callback_data="credit_topup",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back",
+                            callback_data="menu_home",
+                        )
+                    ],
+                ]
+            ),
+        )
+
+        return
     
     if query.data == "menu_debts":
             if not is_bot_admin(query.from_user.id):
@@ -1704,38 +1937,87 @@ async def finish_game_button(
         )
         return
 
-    conn = get_db()
+    price_cents = round(price * 100)
 
     for player in players:
-        # Skip only the organiser/admin themselves
-        # Admin +1s are still chargeable
+
+        # Admin themselves play free.
+        # Their +1s are still charged.
         if (
             is_bot_admin(player["owner_id"])
             and player["type"] == "self"
         ):
             continue
-            
-        conn.execute(
-            """
-            INSERT INTO charges (
-                game_id,
-                owner_id,
-                owner_name,
-                entry_name,
-                amount,
-                status
-            )
-            VALUES (?, ?, ?, ?, ?, 'unpaid')
-            """,
-            (
-                game_id,
-                player["owner_id"],
-                player["owner_name"],
-                player["name"],
-                price,
-            ),
+
+        owner_id = player["owner_id"]
+    
+        old_balance = get_credit_balance(
+            owner_id
+        )
+    
+        credit_used = use_credit(
+            owner_id,
+            price_cents,
+            game_id,
+        )    
+
+        amount_left_cents = (
+            price_cents - credit_used
         )
 
+        # Anything credits didn't cover
+        # becomes normal outstanding debt
+        if amount_left_cents > 0:
+        
+            conn = get_db()
+            
+            conn.execute(
+                """
+                INSERT INTO charges (
+                    game_id,
+                    owner_id,
+                    owner_name,
+                    entry_name,    
+                    amount,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?, 'unpaid')
+                """,
+                (
+                    game_id,
+                    owner_id,
+                    player["owner_name"],    
+                    player["name"],
+                    amount_left_cents / 100,
+                ),
+            )
+
+        new_balance = get_credit_balance(
+            owner_id
+        )
+
+        # Notify only when they CROSS the
+        # low-credit threshold
+        if (
+            old_balance > LOW_CREDIT_THRESHOLD_CENTS
+            and new_balance <= LOW_CREDIT_THRESHOLD_CENTS
+        ):
+            try:
+                await context.bot.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        "⚠️ Your Baddy Buddies credit "
+                        "is running low.\n\n"
+                        f"Current credit: "
+                        f"${new_balance / 100:.2f}\n\n"
+                        "You may want to top up "
+                        "before your next game."
+                    ),
+                )
+            except Exception:
+                pass        
+
+    conn = get_db()
     conn.execute(
         """
         UPDATE games
@@ -2691,6 +2973,327 @@ async def edit_field_button(
         )
     )
     
+async def credit_topup_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "💳 Top Up Credits\n\n"
+            "Choose how much you want to top up:"
+        ),
+        reply_markup=make_topup_keyboard(),
+    )
+    
+async def topup_amount_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    _, amount_text = query.data.split(":")
+    amount_cents = int(amount_text)
+
+    user = query.from_user
+
+    conn = get_db()
+
+    cursor = conn.execute(
+        """
+        INSERT INTO topup_requests (
+            owner_id,
+            owner_name,
+            amount_cents,
+            status
+        )
+        VALUES (?, ?, ?, 'pending')
+        """,
+        (
+            user.id,
+            user.full_name,
+            amount_cents,
+        ),
+    )
+
+    request_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    amount = amount_cents / 100
+
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "✅ Top-up request submitted!\n\n"
+            f"Amount: ${amount:.2f}\n\n"
+            "Your credits will be added after "
+            "an admin confirms your payment."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to menu",
+                        callback_data="menu_home",
+                    )
+                ]
+            ]
+        ),
+    )
+
+    # Send request to all admins
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "💳 Credit Top-up Request\n\n"
+                    f"Player: {user.full_name}\n"
+                    f"Amount: ${amount:.2f}\n\n"
+                    "Confirm after payment has been received."
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "✅ Approve",
+                                callback_data=f"topupapprove:{request_id}",
+                            ),
+                            InlineKeyboardButton(
+                                "❌ Reject",
+                                callback_data=f"topupreject:{request_id}",
+                            ),
+                        ]
+                    ]
+                ),
+            )
+        except Exception as e:
+            print(
+                f"Could not send top-up request "
+                f"to admin {admin_id}: {e}"
+            )
+            
+async def topup_approve_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, request_id_text = query.data.split(":")
+    request_id = int(request_id_text)
+
+    conn = get_db()
+
+    request = conn.execute(
+        """
+        SELECT *
+        FROM topup_requests
+        WHERE id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+    if request is None:
+        conn.close()
+
+        await query.answer(
+            "Top-up request not found.",
+            show_alert=True,
+        )
+        return
+
+    if request["status"] != "pending":
+        conn.close()
+
+        await query.answer(
+            "This request has already been handled.",
+            show_alert=True,
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE topup_requests
+        SET status = 'approved'
+        WHERE id = ?
+        """,
+        (request_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+    add_credit(
+        request["owner_id"],
+        request["owner_name"],
+        request["amount_cents"],
+        description=f"Top-up request #{request_id}",
+    )
+
+    new_balance = get_credit_balance(
+        request["owner_id"]
+    )
+
+    amount = request["amount_cents"] / 100
+
+    await query.answer(
+        "✅ Top-up approved."
+    )
+
+    await query.edit_message_text(
+        (
+            "✅ Top-up approved\n\n"
+            f"{request['owner_name']}\n"
+            f"+${amount:.2f}\n"
+            f"New balance: ${new_balance / 100:.2f}"
+        )
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=request["owner_id"],
+            text=(
+                "✅ Your Baddy Buddies top-up "
+                "has been approved!\n\n"
+                f"Added: ${amount:.2f}\n"
+                f"New credit balance: "
+                f"${new_balance / 100:.2f}"
+            ),
+        )
+    except Exception:
+        pass
+        
+async def topup_reject_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, request_id_text = query.data.split(":")
+    request_id = int(request_id_text)
+
+    conn = get_db()
+
+    request = conn.execute(
+        """
+        SELECT *
+        FROM topup_requests
+        WHERE id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+    if request is None:
+        conn.close()
+
+        await query.answer(
+            "Top-up request not found.",
+            show_alert=True,
+        )
+        return
+
+    if request["status"] != "pending":
+        conn.close()
+
+        await query.answer(
+            "This request has already been handled.",
+            show_alert=True,
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE topup_requests
+        SET status = 'rejected'
+        WHERE id = ?
+        """,
+        (request_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+    amount = request["amount_cents"] / 100
+
+    await query.answer(
+        "Top-up rejected."
+    )
+
+    await query.edit_message_text(
+        (
+            "❌ Top-up rejected\n\n"
+            f"{request['owner_name']}\n"
+            f"${amount:.2f}"
+        )
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=request["owner_id"],
+            text=(
+                "❌ Your Baddy Buddies top-up "
+                "request was not approved.\n\n"
+                f"Amount: ${amount:.2f}"
+            ),
+        )
+    except Exception:
+        pass
+        
+async def topup_cancel_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    await query.answer()
+
+    balance = get_credit_balance(
+        query.from_user.id
+    )
+
+    await query.edit_message_text(
+        (
+            "💳 Baddy Buddies Credit\n\n"
+            f"Available credit: "
+            f"${balance / 100:.2f}"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ Top up",
+                        callback_data="credit_topup",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="menu_home",
+                    )
+                ],
+            ]
+        ),
+    )
         
 # =========================================================
 # BUTTON HANDLER
@@ -3197,7 +3800,7 @@ def main():
         CallbackQueryHandler(
             menu_button,
             pattern=(
-                r"^(menu_home|menu_balance|menu_games|menu_debts)$"
+                r"^(menu_home|menu_balance|menu_credit|menu_games|menu_debts)$"
             )
         )
     )
@@ -3366,6 +3969,41 @@ def main():
                 r"^editfield:\d+:"
                 r"(date|time|location|courts|price|max_players|level|shuttle)$"
             ),
+        )
+    )
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            credit_topup_button,
+            pattern=r"^credit_topup$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            topup_amount_button,
+            pattern=r"^topup:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            topup_approve_button,
+            pattern=r"^topupapprove:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            topup_reject_button,
+            pattern=r"^topupreject:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            topup_cancel_button,
+            pattern=r"^topup_cancel$",
         )
     )
 
