@@ -1046,6 +1046,10 @@ def make_topup_keyboard():
                     "$100",
                     callback_data="topup:10000",
                 ),
+                InlineKeyboardButton(
+                    "✏️ Custom amount",
+                    callback_data="topup_custom",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1991,6 +1995,8 @@ async def finish_game_button(
                     amount_left_cents / 100,
                 ),
             )
+            conn.commit()
+            conn.close()
 
         new_balance = get_credit_balance(
             owner_id
@@ -2391,6 +2397,83 @@ async def create_game_message_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
+    # =====================================================
+    # CUSTOM CREDIT TOP-UP
+    # =====================================================
+
+    if context.user_data.get("custom_topup"):
+        text = update.message.text.strip()
+
+        # Allow either:
+        # 35
+        # $35
+        # 35.50
+        text = text.replace("$", "").strip()
+
+        try:
+            amount = float(text)
+
+            if amount <= 0:
+                raise ValueError
+
+            amount_cents = round(
+                amount * 100
+            )
+
+        except ValueError:
+            await update.message.reply_text(
+                (
+                    "❌ Please enter a valid amount.\n\n"
+                    "Examples:\n"
+                    "20\n"
+                    "35.50\n"
+                    "$50"
+                )
+            )
+            return
+
+        # Optional sensible limit
+        if amount_cents > 100000:
+            await update.message.reply_text(
+                "❌ Maximum top-up is $1,000."
+            )
+            return
+
+        context.user_data.pop(
+            "custom_topup",
+            None,
+        )
+
+        await create_topup_request(
+            context,
+            update.effective_user,
+            amount_cents,
+        )
+
+        await update.message.reply_text(
+            (
+                "✅ Top-up request submitted!\n\n"
+                f"Amount: "
+                f"${amount_cents / 100:.2f}\n\n"
+                "Your credits will be added "
+                "after an admin confirms "
+                "your payment."
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back to menu",
+                            callback_data="menu_home",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
     if context.user_data.get("editing_game"):
         if not is_bot_admin(update.effective_user.id):
             return
@@ -2989,17 +3072,69 @@ async def credit_topup_button(
         reply_markup=make_topup_keyboard(),
     )
     
-async def topup_amount_button(
+async def topup_custom_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
 
-    _, amount_text = query.data.split(":")
-    amount_cents = int(amount_text)
+    # Clear other text-input workflows
+    context.user_data.pop(
+        "creating_game",
+        None,
+    )
+    context.user_data.pop(
+        "create_game_step",
+        None,
+    )
+    context.user_data.pop(
+        "create_game_data",
+        None,
+    )
 
-    user = query.from_user
+    context.user_data.pop(
+        "editing_game",
+        None,
+    )
+    context.user_data.pop(
+        "edit_game_id",
+        None,
+    )
+    context.user_data.pop(
+        "edit_field",
+        None,
+    )
+    
+    context.user_data["custom_topup"] = True
 
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "💳 Custom Top Up\n\n"
+            "Enter the amount you want to top up.\n\n"
+            "Examples:\n"
+            "35\n"
+            "35.50\n"
+            "$50"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel",
+                        callback_data="topup_cancel",
+                    )
+                ]
+            ]
+        ),
+    )
+    
+async def create_topup_request(
+    context,
+    user,
+    amount_cents,
+):
     conn = get_db()
 
     cursor = conn.execute(
@@ -3026,12 +3161,69 @@ async def topup_amount_button(
 
     amount = amount_cents / 100
 
+    # Notify all admins
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "💳 Credit Top-up Request\n\n"
+                    f"Player: {user.full_name}\n"
+                    f"Amount: ${amount:.2f}\n\n"
+                    "Confirm only after payment "
+                    "has been received."
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "✅ Approve",
+                                callback_data=(
+                                    f"topupapprove:{request_id}"
+                                ),
+                            ),
+                            InlineKeyboardButton(
+                                "❌ Reject",
+                                callback_data=(
+                                    f"topupreject:{request_id}"
+                                ),
+                            ),
+                        ]
+                    ]
+                ),
+            )
+
+        except Exception as e:
+            print(
+                f"Could not send top-up request "
+                f"to admin {admin_id}: {e}"
+            )
+
+    return request_id
+    
+async def topup_amount_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    _, amount_text = query.data.split(":")
+    amount_cents = int(amount_text)
+
+    user = query.from_user
+
+    await create_topup_request(
+        context,
+        user,
+        amount_cents,
+    )
+
     await query.answer()
 
     await query.edit_message_text(
         (
             "✅ Top-up request submitted!\n\n"
-            f"Amount: ${amount:.2f}\n\n"
+            f"Amount: ${amount_cents / 100:.2f}\n\n"
             "Your credits will be added after "
             "an admin confirms your payment."
         ),
@@ -3046,38 +3238,6 @@ async def topup_amount_button(
             ]
         ),
     )
-
-    # Send request to all admins
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    "💳 Credit Top-up Request\n\n"
-                    f"Player: {user.full_name}\n"
-                    f"Amount: ${amount:.2f}\n\n"
-                    "Confirm after payment has been received."
-                ),
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "✅ Approve",
-                                callback_data=f"topupapprove:{request_id}",
-                            ),
-                            InlineKeyboardButton(
-                                "❌ Reject",
-                                callback_data=f"topupreject:{request_id}",
-                            ),
-                        ]
-                    ]
-                ),
-            )
-        except Exception as e:
-            print(
-                f"Could not send top-up request "
-                f"to admin {admin_id}: {e}"
-            )
             
 async def topup_approve_button(
     update: Update,
@@ -3124,11 +3284,12 @@ async def topup_approve_button(
         )
         return
 
-    conn.execute(
+    cursor = conn.execute(
         """
         UPDATE topup_requests
         SET status = 'approved'
         WHERE id = ?
+          AND status = 'pending'
         """,
         (request_id,),
     )
@@ -3136,6 +3297,13 @@ async def topup_approve_button(
     conn.commit()
     conn.close()
 
+    if cursor.rowcount == 0:
+        await query.answer(
+            "This request has already been handled.",
+            show_alert=True,
+        )
+        return
+        
     add_credit(
         request["owner_id"],
         request["owner_name"],
@@ -3263,6 +3431,10 @@ async def topup_cancel_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    context.user_data.pop(
+        "custom_topup",
+        None,
+    )
     query = update.callback_query
 
     await query.answer()
@@ -4004,6 +4176,13 @@ def main():
         CallbackQueryHandler(
             topup_cancel_button,
             pattern=r"^topup_cancel$",
+        )
+    )
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            topup_custom_button,
+            pattern=r"^topup_custom$",
         )
     )
 
