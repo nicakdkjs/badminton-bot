@@ -1284,6 +1284,144 @@ def make_topup_keyboard():
         ]
     )
     
+def make_debt_view_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📅 By game",
+                    callback_data="debts_by_game",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👤 By player",
+                    callback_data="debts_by_player",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="menu_home",
+                )
+            ],
+        ]
+    )
+    
+    
+def make_debt_games_keyboard(games):
+    buttons = []
+
+    for game in games:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    (
+                        f"📅 {game['date']} • "
+                        f"{game['time']} • "
+                        f"${game['total']:.2f}"
+                    ),
+                    callback_data=(
+                        f"debtgame:{game['id']}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="menu_debts",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+    
+def make_game_debt_keyboard(
+    game_id,
+    charges,
+    selected,
+):
+    buttons = []
+
+    for charge in charges:
+        charge_id = charge["id"]
+
+        if charge_id in selected:
+            icon = "☑️"
+        else:
+            icon = "⬜"
+
+        if (
+            charge["entry_name"]
+            == charge["owner_name"]
+        ):
+            name = charge["owner_name"]
+        else:
+            name = charge["entry_name"]
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    (
+                        f"{icon} {name} — "
+                        f"${charge['amount']:.2f}"
+                    ),
+                    callback_data=(
+                        f"debttoggle:"
+                        f"{game_id}:"
+                        f"{charge_id}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "☑️ Select all",
+                callback_data=(
+                    f"debtselectall:{game_id}"
+                ),
+            )
+        ]
+    )
+
+    if selected:
+        selected_total = sum(
+            charge["amount"]
+            for charge in charges
+            if charge["id"] in selected
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    (
+                        "✅ Log selected as paid "
+                        f"(${selected_total:.2f})"
+                    ),
+                    callback_data=(
+                        f"debtpayselected:{game_id}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Back to games",
+                callback_data="debts_by_game",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+    
+    
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
@@ -1867,129 +2005,536 @@ async def menu_button(
         return
     
     if query.data == "menu_debts":
-            if not is_bot_admin(query.from_user.id):
-                await query.answer(
+        if not is_bot_admin(query.from_user.id):
+            await query.answer(
                 "❌ You are not authorised to manage payments.",
-                    show_alert=True,
-                )
-                return
-
-            conn = get_db()
-
-            charges = conn.execute(
-                """
-                SELECT
-                    charges.*,
-                    games.date
-                FROM charges
-                JOIN games
-                    ON games.id = charges.game_id
-                WHERE charges.status != 'paid'
-                ORDER BY
-                    charges.owner_name,
-                    games.id,
-                    charges.id
-                """
-            ).fetchall()
-    
-            conn.close()
-    
-            if not charges:
-                await query.answer()
-    
-                await query.edit_message_text(
-                    "✅ Everyone has paid!",
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "⬅️ Back",
-                                    callback_data="menu_home",
-                                )
-                        ]
-                        ]
-                    ),
-                )
-                return
-    
-            people = {}
-    
-            for charge in charges:
-                owner_id = charge["owner_id"]
-    
-                if owner_id not in people:
-                    people[owner_id] = {
-                        "name": charge["owner_name"],
-                        "charges": [],
-                    }
-    
-                people[owner_id]["charges"].append(
-                    charge
-                )
-
-            lines = [
-                "💰 Outstanding Payments",
-                "",
-            ]
-    
-            for person in people.values():
-                lines.append(
-                    f"{person['name']}:"
-                )
-    
-                total = 0
-    
-                for charge in person["charges"]:
-                    amount = charge["amount"]
-                    total += amount
-    
-                    if (
-                        charge["entry_name"]
-                        == charge["owner_name"]
-                    ):
-                        description = charge["date"]
-                    else:
-                        description = (
-                            f"{charge['date']} "
-                            f"({charge['entry_name']})"
-                        )
-
-                    lines.append(
-                        f"• {description} — ${amount:.2f}"
-                    )
-
-                lines.append(
-                    f"Total: ${total:.2f}"
-                )
-                lines.append("")
-    
-            buttons = list(
-                make_debts_keyboard(
-                    people
-                ).inline_keyboard
+                show_alert=True,
             )
-    
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="menu_home",
-                    )
-                ]
-            )
-    
-            await query.answer()
-    
-            await query.edit_message_text(
-                "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(
-                    buttons
-                ),
-            )
-    
             return
 
+        # Clear any old multi-selection
+        context.user_data.pop(
+            "debt_selected_charges",
+            None,
+        )
 
+        await query.answer()
+
+        await query.edit_message_text(
+            (
+                "🧾 Manage Debts\n\n"
+                "How would you like to view "
+                "outstanding payments?"
+            ),
+            reply_markup=make_debt_view_keyboard(),
+        )
+
+        return
+
+async def debts_by_player_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT
+            charges.*,
+            games.date
+        FROM charges
+        JOIN games
+            ON games.id = charges.game_id
+        WHERE charges.status = 'unpaid'
+        ORDER BY
+            charges.owner_name,
+            games.id,
+            charges.id
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not charges:
+        await query.answer()
+
+        await query.edit_message_text(
+            "✅ Everyone has paid!",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back",
+                            callback_data="menu_debts",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    people = {}
+
+    for charge in charges:
+        owner_id = charge["owner_id"]
+
+        if owner_id not in people:
+            people[owner_id] = {
+                "name": charge["owner_name"],
+                "charges": [],
+            }
+
+        people[owner_id]["charges"].append(
+            charge
+        )
+
+    lines = [
+        "👤 Outstanding by Player",
+        "",
+    ]
+
+    for person in people.values():
+        total = sum(
+            charge["amount"]
+            for charge in person["charges"]
+        )
+
+        lines.append(
+            f"{person['name']} — ${total:.2f}"
+        )
+
+    buttons = list(
+        make_debts_keyboard(
+            people
+        ).inline_keyboard
+    )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="menu_debts",
+            )
+        ]
+    )
+
+    await query.answer()
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
+    )
+    
+async def debts_by_game_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    games = conn.execute(
+        """
+        SELECT
+            games.id,
+            games.date,
+            games.time,
+            games.location,
+            SUM(charges.amount) AS total
+        FROM charges
+        JOIN games
+            ON games.id = charges.game_id
+        WHERE charges.status = 'unpaid'
+        GROUP BY
+            games.id,
+            games.date,
+            games.time,
+            games.location
+        ORDER BY games.id DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    await query.answer()
+
+    if not games:
+        await query.edit_message_text(
+            "✅ There are no outstanding payments.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back",
+                            callback_data="menu_debts",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    await query.edit_message_text(
+        "📅 Choose a game:",
+        reply_markup=make_debt_games_keyboard(
+            games
+        ),
+    )
+    
+async def debt_game_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, game_id_text = query.data.split(":")
+    game_id = int(game_id_text)
+
+    game = get_game(game_id)
+
+    if game is None:
+        await query.answer(
+            "Game not found.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT *
+        FROM charges
+        WHERE game_id = ?
+          AND status = 'unpaid'
+        ORDER BY id ASC
+        """,
+        (game_id,),
+    ).fetchall()
+
+    conn.close()
+
+    context.user_data[
+        "debt_selected_charges"
+    ] = set()
+
+    await query.answer()
+
+    if not charges:
+        await query.edit_message_text(
+            "✅ This game has no outstanding payments.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back to games",
+                            callback_data="debts_by_game",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    await query.edit_message_text(
+        (
+            "📅 Log Payments\n\n"
+            f"{game['date']}\n"
+            f"⏰ {game['time']}\n"
+            f"📍 {game['location']}\n\n"
+            "Select everyone who has paid:"
+        ),
+        reply_markup=make_game_debt_keyboard(
+            game_id,
+            charges,
+            set(),
+        ),
+    )
+    
+async def debt_toggle_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, game_id_text, charge_id_text = (
+        query.data.split(":")
+    )
+
+    game_id = int(game_id_text)
+    charge_id = int(charge_id_text)
+
+    selected = context.user_data.setdefault(
+        "debt_selected_charges",
+        set(),
+    )
+
+    if charge_id in selected:
+        selected.remove(charge_id)
+    else:
+        selected.add(charge_id)
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT *
+        FROM charges
+        WHERE game_id = ?
+          AND status = 'unpaid'
+        ORDER BY id ASC
+        """,
+        (game_id,),
+    ).fetchall()
+
+    conn.close()
+
+    # Remove anything that is no longer unpaid
+    valid_ids = {
+        charge["id"]
+        for charge in charges
+    }
+
+    selected.intersection_update(
+        valid_ids
+    )
+
+    await query.answer()
+
+    await query.edit_message_reply_markup(
+        reply_markup=make_game_debt_keyboard(
+            game_id,
+            charges,
+            selected,
+        )
+    )
+
+async def debt_select_all_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, game_id_text = query.data.split(":")
+    game_id = int(game_id_text)
+
+    conn = get_db()
+
+    charges = conn.execute(
+        """
+        SELECT *
+        FROM charges
+        WHERE game_id = ?
+          AND status = 'unpaid'
+        ORDER BY id ASC
+        """,
+        (game_id,),
+    ).fetchall()
+
+    conn.close()
+
+    selected = {
+        charge["id"]
+        for charge in charges
+    }
+
+    context.user_data[
+        "debt_selected_charges"
+    ] = selected
+
+    await query.answer(
+        "All selected."
+    )
+
+    await query.edit_message_reply_markup(
+        reply_markup=make_game_debt_keyboard(
+            game_id,
+            charges,
+            selected,
+        )
+    )
+    
+async def debt_pay_selected_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, game_id_text = query.data.split(":")
+    game_id = int(game_id_text)
+
+    selected = context.user_data.get(
+        "debt_selected_charges",
+        set(),
+    )
+
+    if not selected:
+        await query.answer(
+            "Select at least one payment.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    placeholders = ",".join(
+        "?"
+        for _ in selected
+    )
+
+    charges = conn.execute(
+        f"""
+        SELECT *
+        FROM charges
+        WHERE game_id = ?
+          AND status = 'unpaid'
+          AND id IN ({placeholders})
+        """,
+        (
+            game_id,
+            *selected,
+        ),
+    ).fetchall()
+
+    if not charges:
+        conn.close()
+
+        await query.answer(
+            "These payments have already been recorded.",
+            show_alert=True,
+        )
+        return
+
+    charge_ids = [
+        charge["id"]
+        for charge in charges
+    ]
+
+    placeholders = ",".join(
+        "?"
+        for _ in charge_ids
+    )
+
+    conn.execute(
+        f"""
+        UPDATE charges
+        SET status = 'paid',
+            paid_at = CURRENT_TIMESTAMP
+        WHERE id IN ({placeholders})
+          AND status = 'unpaid'
+        """,
+        charge_ids,
+    )
+
+    conn.commit()
+    conn.close()
+
+    total = sum(
+        charge["amount"]
+        for charge in charges
+    )
+
+    names = []
+
+    for charge in charges:
+        if (
+            charge["entry_name"]
+            == charge["owner_name"]
+        ):
+            names.append(
+                charge["owner_name"]
+            )
+        else:
+            names.append(
+                charge["entry_name"]
+            )
+
+    context.user_data.pop(
+        "debt_selected_charges",
+        None,
+    )
+
+    game = get_game(game_id)
+
+    await query.answer(
+        "✅ Payments recorded."
+    )
+
+    await query.edit_message_text(
+        (
+            "✅ Payments recorded\n\n"
+            f"📅 {game['date']}\n"
+            f"⏰ {game['time']}\n\n"
+            + "\n".join(
+                f"• {name}"
+                for name in names
+            )
+            + f"\n\n💰 Total: ${total:.2f}"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📅 Back to games",
+                        callback_data="debts_by_game",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 Main menu",
+                        callback_data="menu_home",
+                    )
+                ],
+            ]
+        ),
+    )
+    
 async def view_game_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2299,87 +2844,18 @@ async def debts_command(
         )
         return
 
-    conn = get_db()
-
-    charges = conn.execute(
-        """
-        SELECT
-            charges.*,
-            games.date
-        FROM charges
-        JOIN games
-            ON games.id = charges.game_id
-        WHERE charges.status != 'paid'
-        ORDER BY
-            charges.owner_name,
-            games.id,
-            charges.id
-        """
-    ).fetchall()
-
-    conn.close()
-
-    if not charges:
-        await update.message.reply_text(
-            "✅ Everyone has paid!"
-        )
-        return
-
-    people = {}
-
-    for charge in charges:
-        owner_id = charge["owner_id"]
-
-        if owner_id not in people:
-            people[owner_id] = {
-                "name": charge["owner_name"],
-                "charges": [],
-            }
-
-        people[owner_id]["charges"].append(
-            charge
-        )
-
-    lines = [
-        "💰 Outstanding Payments",
-        "",
-    ]
-
-    for person in people.values():
-        lines.append(
-            f"{person['name']}:"
-        )
-
-        total = 0
-
-        for charge in person["charges"]:
-            amount = charge["amount"]
-            total += amount
-
-            if (
-                charge["entry_name"]
-                == charge["owner_name"]
-            ):
-                description = charge["date"]
-            else:
-                description = (
-                    f"{charge['date']} "
-                    f"({charge['entry_name']})"
-                )
-
-            lines.append(
-                f"• {description} — "
-                f"${amount:.2f}"
-            )
-
-        lines.append(
-            f"Total: ${total:.2f}"
-        )
-        lines.append("")
+    context.user_data.pop(
+        "debt_selected_charges",
+        None,
+    )
 
     await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=make_debts_keyboard(people),
+        (
+            "🧾 Manage Debts\n\n"
+            "How would you like to view "
+            "outstanding payments?"
+        ),
+        reply_markup=make_debt_view_keyboard(),
     )
     
 async def pay_all_button(
@@ -4743,6 +5219,48 @@ def main():
         CallbackQueryHandler(
             repost_game_confirm_button,
             pattern=r"^repostconfirm:\d+$",
+        )
+    )
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            debts_by_player_button,
+            pattern=r"^debts_by_player$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            debts_by_game_button,
+            pattern=r"^debts_by_game$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            debt_game_button,
+            pattern=r"^debtgame:\d+$",
+        )
+    )    
+
+    app.add_handler(
+        CallbackQueryHandler(
+            debt_toggle_button,
+            pattern=r"^debttoggle:\d+:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            debt_select_all_button,
+            pattern=r"^debtselectall:\d+$",
+        )
+    )    
+
+    app.add_handler(
+        CallbackQueryHandler(
+            debt_pay_selected_button,
+            pattern=r"^debtpayselected:\d+$",
         )
     )
 
