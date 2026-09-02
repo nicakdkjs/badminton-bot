@@ -153,11 +153,80 @@ def setup_database():
         )
         """
     )
+    
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            username TEXT,
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+)
 
     conn.commit()
     conn.close()
 
+def register_bot_user(user_id, full_name, username=None):
+    conn = get_db()
 
+    conn.execute(
+        """
+        INSERT INTO bot_users (
+            user_id,
+            full_name,
+            username
+        )
+        VALUES (?, ?, ?)
+
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            full_name = excluded.full_name,
+            username = excluded.username,
+            last_seen_at = CURRENT_TIMESTAMP
+        """,
+        (
+            user_id,
+            full_name,
+            username,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+    
+def import_existing_players():
+    conn = get_db()
+
+    users = conn.execute(
+        """
+        SELECT DISTINCT
+            owner_id,
+            owner_name
+        FROM entries
+        """
+    ).fetchall()
+
+    for user in users:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bot_users (
+                user_id,
+                full_name
+            )
+            VALUES (?, ?)
+            """,
+            (
+                user["owner_id"],
+                user["owner_name"],
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+    
 def get_game(game_id):
     conn = get_db()
 
@@ -1067,23 +1136,30 @@ def make_topup_keyboard():
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):	
+):
     print(
-     "CHAT ID:",
-     update.effective_chat.id
+        "CHAT ID:",
+        update.effective_chat.id,
+        flush=True,
     )
+
     if update.effective_chat.type == "private":
+
+        user = update.effective_user
+
+        register_bot_user(
+            user.id,
+            user.full_name,
+            user.username,
+        )
+
         await update.message.reply_text(
             "🏸 Welcome to Baddy Buddies Bot\n\n"
             "What would you like to do?",
             reply_markup=make_main_menu(
-                update.effective_user.id
-	    ),
+                user.id
+            ),
         )
-    #else:
-    #    await update.message.reply_text(
-    #        "🏸 Baddy Buddies bot is online!"
-    #    )
 
 async def create_game(
     update: Update,
@@ -3466,7 +3542,84 @@ async def topup_cancel_button(
             ]
         ),
     )
-        
+       
+async def broadcast_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_bot_admin(
+        update.effective_user.id
+    ):
+        await update.message.reply_text(
+            "❌ You are not authorised to broadcast messages."
+        )
+        return
+
+    message = (
+        update.message.text
+        .partition(" ")[2]
+        .strip()
+    )
+
+    if not message:
+        await update.message.reply_text(
+            (
+                "📢 Broadcast\n\n"
+                "Use:\n"
+                "/broadcast Your message here"
+            )
+        )
+        return
+
+    conn = get_db()
+
+    users = conn.execute(
+        """
+        SELECT
+            user_id,
+            full_name
+        FROM bot_users
+        ORDER BY full_name
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not users:
+        await update.message.reply_text(
+            "❌ There are no registered bot users."
+        )
+        return
+
+    sent = 0
+    failed = 0
+
+    for user in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user["user_id"],
+                text=message,
+            )
+
+            sent += 1
+
+        except Exception as e:
+            print(
+                f"Broadcast failed for "
+                f"{user['full_name']} "
+                f"({user['user_id']}): {e}",
+                flush=True,
+            )
+
+            failed += 1
+
+    await update.message.reply_text(
+        (
+            "📢 Broadcast complete!\n\n"
+            f"✅ Sent: {sent}\n"
+            f"❌ Failed: {failed}"
+        )
+    ) 
 # =========================================================
 # BUTTON HANDLER
 # =========================================================
@@ -3499,6 +3652,12 @@ async def button_handler(
     user = query.from_user
     user_id = user.id
     user_name = user.full_name
+    
+    register_bot_user(
+        user.id,
+        user.full_name,
+        user.username,
+    )
 
     promoted = []
 
@@ -3932,6 +4091,7 @@ async def button_handler(
 
 def main():
     setup_database()
+    import_existing_players()
 
     request = HTTPXRequest(
         connect_timeout=20,
@@ -4185,6 +4345,13 @@ def main():
             pattern=r"^topup_custom$",
         )
     )
+    
+    app.add_handler(
+        CommandHandler(
+            "broadcast",
+            broadcast_command,
+        )
+    )    
 
     print("🏸 Baddy Buddies is running...")
 
