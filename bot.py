@@ -390,6 +390,128 @@ def add_credit(
     conn.commit()
     conn.close()
 
+def apply_topup_to_debt(
+    owner_id,
+    owner_name,
+    amount_cents,
+):
+    conn = get_db()
+
+    remaining_cents = amount_cents
+    debt_paid_cents = 0
+
+    charges = conn.execute(
+        """
+        SELECT
+            id,
+            game_id,
+            amount
+        FROM charges
+        WHERE owner_id = ?
+          AND status = 'unpaid'
+        ORDER BY created_at ASC, id ASC
+        """,
+        (owner_id,),
+    ).fetchall()
+
+    for charge in charges:
+        if remaining_cents <= 0:
+            break
+
+        charge_cents = round(
+            charge["amount"] * 100
+        )
+
+        # Enough top-up to completely clear this debt
+        if remaining_cents >= charge_cents:
+            conn.execute(
+                """
+                UPDATE charges
+                SET status = 'paid',
+                    paid_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (charge["id"],),
+            )
+
+            remaining_cents -= charge_cents
+            debt_paid_cents += charge_cents
+
+        else:
+            # Only partially pay this charge
+            amount_left_cents = (
+                charge_cents - remaining_cents
+            )
+
+            conn.execute(
+                """
+                UPDATE charges
+                SET amount = ?
+                WHERE id = ?
+                """,
+                (
+                    amount_left_cents / 100,
+                    charge["id"],
+                ),
+            )
+
+            debt_paid_cents += remaining_cents
+            remaining_cents = 0
+
+    # Whatever is left becomes usable credit
+    if remaining_cents > 0:
+        conn.execute(
+            """
+            INSERT INTO credit_accounts (
+                owner_id,
+                owner_name,
+                balance_cents
+            )
+            VALUES (?, ?, ?)
+
+            ON CONFLICT(owner_id)
+            DO UPDATE SET
+                owner_name = excluded.owner_name,
+                balance_cents =
+                    credit_accounts.balance_cents
+                    + excluded.balance_cents
+            """,
+            (
+                owner_id,
+                owner_name,
+                remaining_cents,
+            ),
+        )
+
+    # Record the original top-up
+    conn.execute(
+        """
+        INSERT INTO credit_transactions (
+            owner_id,
+            amount_cents,
+            transaction_type,
+            description
+        )
+        VALUES (?, ?, 'topup', ?)
+        """,
+        (
+            owner_id,
+            amount_cents,
+            (
+                f"Top up: "
+                f"${debt_paid_cents / 100:.2f} "
+                f"applied to debt, "
+                f"${remaining_cents / 100:.2f} "
+                f"added to credit"
+            ),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return debt_paid_cents, remaining_cents
+    
 
 def use_credit(
     owner_id,
@@ -3620,11 +3742,12 @@ async def topup_approve_button(
         )
         return
         
-    add_credit(
-        request["owner_id"],
-        request["owner_name"],
-        request["amount_cents"],
-        description=f"Top-up request #{request_id}",
+    debt_paid_cents, credit_added_cents = (
+        apply_topup_to_debt(
+            request["owner_id"],
+            request["owner_name"],
+            request["amount_cents"],
+        )
     )
 
     new_balance = get_credit_balance(
@@ -3641,8 +3764,13 @@ async def topup_approve_button(
         (
             "✅ Top-up approved\n\n"
             f"{request['owner_name']}\n"
-            f"+${amount:.2f}\n"
-            f"New balance: ${new_balance / 100:.2f}"
+            f"Top-up: ${amount:.2f}\n"
+            f"🧾 Debt paid: "
+            f"${debt_paid_cents / 100:.2f}\n"
+            f"💳 Credit added: "
+            f"${credit_added_cents / 100:.2f}\n"
+            f"💰 New credit balance: "
+            f"${new_balance / 100:.2f}"
         )
     )
 
@@ -3652,8 +3780,12 @@ async def topup_approve_button(
             text=(
                 "✅ Your Baddy Buddies top-up "
                 "has been approved!\n\n"
-                f"Added: ${amount:.2f}\n"
-                f"New credit balance: "
+                f"Top-up: ${amount:.2f}\n"
+                f"🧾 Applied to outstanding debt: "
+                f"${debt_paid_cents / 100:.2f}\n"
+                f"💳 Added to credit: "
+                f"${credit_added_cents / 100:.2f}\n"
+                f"💰 Credit balance: "
                 f"${new_balance / 100:.2f}"
             ),
         )
