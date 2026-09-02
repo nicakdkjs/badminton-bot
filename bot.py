@@ -527,6 +527,12 @@ def make_main_menu(user_id):
                         callback_data="admin_cancel_game",
                     ),
                 ],
+                [
+                    InlineKeyboardButton(
+                        "♻️ Repost game",
+                         callback_data="admin_repost_game",
+                    )
+                ],
             ]
         )
 
@@ -1044,6 +1050,33 @@ def make_edit_game_keyboard(games):
 
     return InlineKeyboardMarkup(buttons)
 
+def make_repost_game_keyboard(games):
+    buttons = []
+
+    for game in games:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    (
+                        f"♻️ {game['date']} • "
+                        f"{game['time']} • "
+                        f"${game['price']}"
+                    ),
+                    callback_data=f"repostgame:{game['id']}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="menu_home",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
 
 def make_edit_field_keyboard(game_id):
     return InlineKeyboardMarkup(
@@ -3020,6 +3053,213 @@ async def admin_edit_game_button(
         reply_markup=make_edit_game_keyboard(games),
     )
     
+async def admin_repost_game_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    games = conn.execute(
+        """
+        SELECT *
+        FROM games
+        WHERE finished = 0
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    await query.answer()
+
+    if not games:
+        await query.edit_message_text(
+            "There are no active games to repost.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back",
+                            callback_data="menu_home",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    await query.edit_message_text(
+        (
+            "♻️ Repost Game\n\n"
+            "Choose the game whose original "
+            "group message was deleted:"
+        ),
+        reply_markup=make_repost_game_keyboard(games),
+    )
+    
+async def repost_game_select_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, game_id_text = query.data.split(":")
+    game_id = int(game_id_text)
+
+    game = get_game(game_id)
+
+    if game is None or game["finished"]:
+        await query.answer(
+            "This game is no longer active.",
+            show_alert=True,
+        )
+        return
+
+    players = get_players(game_id)
+    waitlist = get_waitlist(game_id)
+
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "⚠️ Repost this game to the group?\n\n"
+            f"{make_game_text(game, players, waitlist)}\n\n"
+            "This should only be used if the "
+            "original group message was deleted."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Repost game",
+                        callback_data=f"repostconfirm:{game_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="admin_repost_game",
+                    )
+                ],
+            ]
+        ),
+    )
+    
+    
+async def repost_game_confirm_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, game_id_text = query.data.split(":")
+    game_id = int(game_id_text)
+
+    game = get_game(game_id)
+
+    if game is None or game["finished"]:
+        await query.answer(
+            "This game is no longer active.",
+            show_alert=True,
+        )
+        return
+
+    players = get_players(game_id)
+    waitlist = get_waitlist(game_id)
+
+    try:
+        sent_message = await context.bot.send_message(
+            chat_id=GAME_CHAT_ID,
+            text=make_game_text(
+                game,
+                players,
+                waitlist,
+            ),
+            reply_markup=make_keyboard(game_id),
+        )
+
+    except Exception as e:
+        print(
+            f"Failed to repost game {game_id}: {e}",
+            flush=True,
+        )
+
+        await query.answer(
+            "❌ Could not repost game.",
+            show_alert=True,
+        )
+        return
+
+    # Point the existing game at the new Telegram message.
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE games
+        SET chat_id = ?,
+            message_id = ?
+        WHERE id = ?
+        """,
+        (
+            sent_message.chat_id,
+            sent_message.message_id,
+            game_id,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await query.answer(
+        "✅ Game reposted!"
+    )
+
+    await query.edit_message_text(
+        (
+            "✅ Game reposted successfully!\n\n"
+            f"📅 {game['date']}\n"
+            f"⏰ {game['time']}\n"
+            f"📍 {game['location']}\n\n"
+            f"👥 {len(players)} player(s)\n"
+            f"⏳ {len(waitlist)} waitlisted\n\n"
+            "The existing signups were preserved."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to menu",
+                        callback_data="menu_home",
+                    )
+                ]
+            ]
+        ),
+    )
+    
+    
 async def edit_game_select_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4352,6 +4592,27 @@ def main():
             broadcast_command,
         )
     )    
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_repost_game_button,
+            pattern=r"^admin_repost_game$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            repost_game_select_button,
+            pattern=r"^repostgame:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            repost_game_confirm_button,
+            pattern=r"^repostconfirm:\d+$",
+        )
+    )
 
     print("🏸 Baddy Buddies is running...")
 
