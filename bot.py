@@ -4669,7 +4669,10 @@ async def credit_history_button(
             f"{icon} {label} • {amount_text}"
         )
 
-        if description:
+        if (
+            description
+            and transaction_type != "game"
+        ):
             lines.append(
                 f"   {description}"
             )
@@ -4908,7 +4911,7 @@ async def topup_approve_button(
                 "✅ Your Baddy Buddies top-up "
                 "has been approved!\n\n"
                 f"Top-up: ${amount:.2f}\n"
-                f"🧾 Applied to outstanding debt: "
+                f"🧾 Applied to outstanding balance: "
                 f"${debt_paid_cents / 100:.2f}\n"
                 f"💳 Added to credit: "
                 f"${credit_added_cents / 100:.2f}\n"
@@ -5032,6 +5035,12 @@ async def topup_cancel_button(
                         callback_data="credit_topup",
                     )
                 ],
+                [
+                    InlineKeyboardButton(
+                        "📜 Credit history",
+                        callback_data="credit_history",
+                    )
+       	        ],
                 [
                     InlineKeyboardButton(
                         "⬅️ Back",
