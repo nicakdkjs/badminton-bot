@@ -887,18 +887,18 @@ def make_credit_deduct_keyboard(owner_id):
         [
             [
                 InlineKeyboardButton(
-                    "-$5",
-                    callback_data=f"creditdeduct:{owner_id}:500",
+                    "-$11",
+                    callback_data=f"creditdeduct:{owner_id}:1100",
                 ),
                 InlineKeyboardButton(
-                    "-$10",
-                    callback_data=f"creditdeduct:{owner_id}:1000",
+                    "-$16",
+                    callback_data=f"creditdeduct:{owner_id}:1600",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "-$20",
-                    callback_data=f"creditdeduct:{owner_id}:2000",
+                    "-$17",
+                    callback_data=f"creditdeduct:{owner_id}:1700",
                 ),
                 InlineKeyboardButton(
                     "✏️ Custom",
@@ -1194,10 +1194,6 @@ async def credit_deduct_custom_button(
         (
             "✏️ Custom Credit Deduction\n\n"
             "Enter the amount to deduct.\n\n"
-            "Examples:\n"
-            "11\n"
-            "16\n"
-            "$17"
         ),
         reply_markup=InlineKeyboardMarkup(
             [
