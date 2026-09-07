@@ -3,6 +3,10 @@ import sqlite3
 import time
 from telegram.error import BadRequest
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -4629,6 +4633,24 @@ async def credit_history_button(
         description = transaction[
             "description"
         ]
+        
+        
+        created_at_raw = transaction["created_at"]
+
+        created_at_utc = datetime.strptime(
+            created_at_raw,
+            "%Y-%m-%d %H:%M:%S",
+        ).replace(
+            tzinfo=ZoneInfo("UTC")
+        )
+
+        created_at_sg = created_at_utc.astimezone(
+            ZoneInfo("Asia/Singapore")
+        )        
+
+        created_at = created_at_sg.strftime(
+            "%d %b %Y, %I:%M %p"
+        )
 
         if transaction_type == "topup":
             icon = "➕"
