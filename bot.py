@@ -3566,8 +3566,6 @@ async def create_game_message_handler(
                 -amount_cents,
                 (
                     f"Manual credit deduction "
-                    f"by admin "
-                    f"{update.effective_user.full_name}"
                 ),
             ),
         )
