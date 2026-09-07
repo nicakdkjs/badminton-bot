@@ -516,7 +516,6 @@ def apply_topup_to_debt(
 
     return debt_paid_cents, remaining_cents
     
-
 def use_credit(
     owner_id,
     amount_cents,
@@ -524,28 +523,34 @@ def use_credit(
 ):
     balance = get_credit_balance(owner_id)
 
-    used = min(
-        balance,
-        amount_cents,
-    )
-
-    if used <= 0:
+    # Only use credit when the entire spot
+    # can be paid from the available balance.
+    if balance < amount_cents:
         return 0
 
     conn = get_db()
 
-    conn.execute(
+    cursor = conn.execute(
         """
         UPDATE credit_accounts
         SET balance_cents =
             balance_cents - ?
         WHERE owner_id = ?
+          AND balance_cents >= ?
         """,
         (
-            used,
+            amount_cents,
             owner_id,
+            amount_cents,
         ),
     )
+
+    # Balance changed before deduction.
+    # Do not create a transaction.
+    if cursor.rowcount == 0:
+        conn.rollback()
+        conn.close()
+        return 0
 
     conn.execute(
         """
@@ -560,7 +565,7 @@ def use_credit(
         """,
         (
             owner_id,
-            -used,
+            -amount_cents,
             game_id,
             f"Game #{game_id}",
         ),
@@ -569,8 +574,7 @@ def use_credit(
     conn.commit()
     conn.close()
 
-    return used
-    
+    return amount_cents
 # =========================================================
 # GAME DISPLAY
 # =========================================================
@@ -3083,6 +3087,8 @@ async def finish_game_button(
         return
 
     price_cents = round(price * 100)
+    
+    insufficient_credit = {}
 
     for player in players:
 
@@ -3104,7 +3110,24 @@ async def finish_game_button(
             owner_id,
             price_cents,
             game_id,
-        )    
+        )
+
+        # Credit was insufficient, so nothing was deducted.
+        if credit_used == 0:
+            if owner_id not in insufficient_credit:
+                insufficient_credit[owner_id] = {
+                    "name": player["owner_name"],
+                    "entries": [],
+                    "total_cents": 0,
+                }
+
+            insufficient_credit[owner_id]["entries"].append(
+                player["name"]
+            )
+
+            insufficient_credit[owner_id]["total_cents"] += (
+                price_cents
+            )
 
         amount_left_cents = (
             price_cents - credit_used
@@ -3163,7 +3186,47 @@ async def finish_game_button(
                 )
             except Exception:
                 pass        
+	
+	
+    for owner_id, info in insufficient_credit.items():
+        try:
+            current_balance = get_credit_balance(
+                owner_id
+            )
 
+            entry_lines = "\n".join(
+                f"• {name} — ${price:.2f}"
+                for name in info["entries"]
+            )
+
+            await context.bot.send_message(
+                chat_id=owner_id,
+                text=(
+                    "⚠️ Insufficient credit\n\n"
+                    f"📅 {game['date']}\n"
+                   f"⏰ {game['time']}\n\n"
+                    "Your credit balance was not enough "
+                    "to fully pay for the spot(s) below, "
+                    "so no credit was deducted for them.\n\n"
+                    f"💳 Credit balance: "
+                    f"${current_balance / 100:.2f}\n\n"
+                    f"💰 Outstanding:\n"
+                    f"{entry_lines}\n"
+                    f"Total: "
+                    f"${info['total_cents'] / 100:.2f}\n\n"
+                    "The full amount has been added to "
+                    "your outstanding balance."
+                ),
+            )
+
+        except Exception as e:
+            print(
+                f"Could not notify {owner_id} "
+                f"about insufficient credit: {e}",
+                flush=True,
+            )
+        
+        
     conn = get_db()
     conn.execute(
         """
@@ -4917,7 +4980,7 @@ async def topup_approve_button(
             "✅ Top-up approved\n\n"
             f"{request['owner_name']}\n"
             f"Top-up: ${amount:.2f}\n"
-            f"🧾 Debt paid: "
+            f"🧾 Applied to balance: "
             f"${debt_paid_cents / 100:.2f}\n"
             f"💳 Credit added: "
             f"${credit_added_cents / 100:.2f}\n"
