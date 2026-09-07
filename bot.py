@@ -500,7 +500,7 @@ def apply_topup_to_debt(
             (
                 f"Top up: "
                 f"${debt_paid_cents / 100:.2f} "
-                f"applied to debt, "
+                f"applied to outstanding balance, "
                 f"${remaining_cents / 100:.2f} "
                 f"added to credit"
             ),
@@ -1116,8 +1116,7 @@ async def credit_deduct_button(
             owner_id,
             -amount_cents,
             (
-                f"Manual credit deduction "
-                f"by admin {query.from_user.full_name}"
+                f"Manual credit deduction"
             ),
         ),
     )
@@ -2346,6 +2345,12 @@ async def menu_button(
                         InlineKeyboardButton(
                             "➕ Top up",
                             callback_data="credit_topup",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📜 Credit history",
+                            callback_data="credit_history",
                         )
                     ],
                     [
@@ -4540,6 +4545,158 @@ async def topup_custom_button(
         ),
     )
     
+async def credit_history_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    conn = get_db()
+
+    transactions = conn.execute(
+        """
+        SELECT
+            credit_transactions.amount_cents,
+            credit_transactions.transaction_type,
+            credit_transactions.game_id,
+            credit_transactions.description,
+            credit_transactions.created_at,
+            games.date AS game_date,
+            games.time AS game_time
+        FROM credit_transactions
+
+        LEFT JOIN games
+            ON games.id =
+               credit_transactions.game_id
+
+        WHERE credit_transactions.owner_id = ?
+
+        ORDER BY credit_transactions.id DESC
+        LIMIT 30
+        """,
+        (user_id,),
+    ).fetchall()
+
+    conn.close()
+
+    balance = get_credit_balance(
+        user_id
+    )
+
+    await query.answer()
+
+    if not transactions:
+        await query.edit_message_text(
+            (
+                "📜 Credit History\n\n"
+                "You do not have any credit "
+                "transactions yet.\n\n"
+                f"Current balance: "
+                f"${balance / 100:.2f}"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back to credits",
+                            callback_data="menu_credit",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    lines = [
+        "📜 Credit History",
+        "",
+        f"Current balance: ${balance / 100:.2f}",
+        "",
+    ]
+
+    for transaction in transactions:
+        amount_cents = transaction[
+            "amount_cents"
+        ]
+
+        transaction_type = transaction[
+            "transaction_type"
+        ]
+
+        created_at = transaction[
+            "created_at"
+        ]
+
+        description = transaction[
+            "description"
+        ]
+
+        if transaction_type == "topup":
+            icon = "➕"
+            label = "Top up"
+
+        elif transaction_type == "game":
+            icon = "🏸"
+
+            if transaction["game_date"]:
+                label = (
+                    f"{transaction['game_date']} "
+                    f"• {transaction['game_time']}"
+                )
+            else:
+                label = "Game"
+
+        elif transaction_type == "manual_deduction":
+            icon = "➖"
+            label = "Manual deduction"
+
+        else:
+            icon = "💳"
+            label = transaction_type.replace(
+                "_",
+                " ",
+            ).title()
+
+        if amount_cents >= 0:
+            amount_text = (
+                f"+${amount_cents / 100:.2f}"
+            )
+        else:
+            amount_text = (
+                f"-${abs(amount_cents) / 100:.2f}"
+            )
+
+        lines.append(
+            f"{icon} {label} • {amount_text}"
+        )
+
+        if description:
+            lines.append(
+                f"   {description}"
+            )
+
+        lines.append(
+            f"   {created_at}"
+        )
+
+        lines.append("")
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to credits",
+                        callback_data="menu_credit",
+                    )
+                ]
+            ]
+        ),
+    )
+    
+       
 async def create_topup_request(
     context,
     user,
@@ -5824,8 +5981,15 @@ def main():
     CallbackQueryHandler(
         admin_manage_credits_button,
         pattern=r"^admin_manage_credits$",
+        )
     )
-)
+	
+    app.add_handler(
+        CallbackQueryHandler(
+            credit_history_button,
+            pattern=r"^credit_history$",
+        )
+    )
 
     app.add_handler(
         CallbackQueryHandler(
