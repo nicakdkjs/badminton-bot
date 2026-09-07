@@ -627,7 +627,11 @@ def make_main_menu(user_id):
                     InlineKeyboardButton(
                         "🧾 View all debts",
                         callback_data="menu_debts",
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        "💳 Manage credits",
+                        callback_data="admin_manage_credits",
+                    ),
                 ],
                 [
                     InlineKeyboardButton(
@@ -850,6 +854,362 @@ def make_specific_payment_keyboard(owner_id, charges):
 
     return InlineKeyboardMarkup(buttons)
 
+def make_credit_players_keyboard(accounts):
+    buttons = []
+
+    for account in accounts:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    (
+                        f"{account['owner_name']} — "
+                        f"${account['balance_cents'] / 100:.2f}"
+                    ),
+                    callback_data=f"creditplayer:{account['owner_id']}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="menu_home",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def make_credit_deduct_keyboard(owner_id):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "-$5",
+                    callback_data=f"creditdeduct:{owner_id}:500",
+                ),
+                InlineKeyboardButton(
+                    "-$10",
+                    callback_data=f"creditdeduct:{owner_id}:1000",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "-$20",
+                    callback_data=f"creditdeduct:{owner_id}:2000",
+                ),
+                InlineKeyboardButton(
+                    "✏️ Custom",
+                    callback_data=f"creditdeductcustom:{owner_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="admin_manage_credits",
+                )
+            ],
+        ]
+    )
+
+async def admin_manage_credits_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    conn = get_db()
+
+    accounts = conn.execute(
+        """
+        SELECT
+            owner_id,
+            owner_name,
+            balance_cents
+        FROM credit_accounts
+        WHERE balance_cents > 0
+        ORDER BY balance_cents DESC, owner_name ASC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    await query.answer()
+
+    if not accounts:
+        await query.edit_message_text(
+            "💳 No players currently have credits.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Back",
+                            callback_data="menu_home",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    total_cents = sum(
+        account["balance_cents"]
+        for account in accounts
+    )
+
+    await query.edit_message_text(
+        (
+            "💳 Player Credits\n\n"
+            f"Players with credit: {len(accounts)}\n"
+            f"Total outstanding credit: "
+            f"${total_cents / 100:.2f}\n\n"
+            "Choose a player:"
+        ),
+        reply_markup=make_credit_players_keyboard(
+            accounts
+        ),
+    )
+
+async def credit_player_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    context.user_data.pop(
+        "custom_credit_deduction",
+        None,
+    )
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, owner_id_text = query.data.split(":")
+    owner_id = int(owner_id_text)
+
+    conn = get_db()
+
+    account = conn.execute(
+        """
+        SELECT
+            owner_id,
+            owner_name,
+            balance_cents
+        FROM credit_accounts
+        WHERE owner_id = ?
+        """,
+        (owner_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if account is None:
+        await query.answer(
+            "Credit account not found.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "💳 Manage Credit\n\n"
+            f"Player: {account['owner_name']}\n"
+            f"Current balance: "
+            f"${account['balance_cents'] / 100:.2f}\n\n"
+            "How much would you like to deduct?"
+        ),
+        reply_markup=make_credit_deduct_keyboard(
+            owner_id
+        ),
+    )
+    
+async def credit_deduct_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, owner_id_text, amount_text = (
+        query.data.split(":")
+    )
+
+    owner_id = int(owner_id_text)
+    amount_cents = int(amount_text)
+
+    conn = get_db()
+
+    account = conn.execute(
+        """
+        SELECT
+            owner_name,
+            balance_cents
+        FROM credit_accounts
+        WHERE owner_id = ?
+        """,
+        (owner_id,),
+    ).fetchone()
+
+    if account is None:
+        conn.close()
+
+        await query.answer(
+            "Credit account not found.",
+            show_alert=True,
+        )
+        return
+
+    if amount_cents > account["balance_cents"]:
+        conn.close()
+
+        await query.answer(
+            "❌ Cannot deduct more than the current balance.",
+            show_alert=True,
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE credit_accounts
+        SET balance_cents =
+            balance_cents - ?
+        WHERE owner_id = ?
+        """,
+        (
+            amount_cents,
+            owner_id,
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO credit_transactions (
+            owner_id,
+            amount_cents,
+            transaction_type,
+            description
+        )
+        VALUES (?, ?, 'manual_deduction', ?)
+        """,
+        (
+            owner_id,
+            -amount_cents,
+            (
+                f"Manual credit deduction "
+                f"by admin {query.from_user.full_name}"
+            ),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    new_balance = get_credit_balance(
+        owner_id
+    )
+
+    await query.answer(
+        "✅ Credit deducted."
+    )
+
+    await query.edit_message_text(
+        (
+            "✅ Credit deducted\n\n"
+            f"Player: {account['owner_name']}\n"
+            f"Deducted: ${amount_cents / 100:.2f}\n"
+            f"New balance: ${new_balance / 100:.2f}"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "💳 Back to credits",
+                        callback_data="admin_manage_credits",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 Main menu",
+                        callback_data="menu_home",
+                    )
+                ],
+            ]
+        ),
+    )
+    
+async def credit_deduct_custom_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_bot_admin(query.from_user.id):
+        await query.answer(
+            "❌ You are not authorised.",
+            show_alert=True,
+        )
+        return
+
+    _, owner_id_text = query.data.split(":")
+    owner_id = int(owner_id_text)
+
+    # Clear other text-input workflows
+    context.user_data.pop("custom_topup", None)
+
+    context.user_data.pop("creating_game", None)
+    context.user_data.pop("create_game_step", None)
+    context.user_data.pop("create_game_data", None)
+
+    context.user_data.pop("editing_game", None)
+    context.user_data.pop("edit_game_id", None)
+    context.user_data.pop("edit_field", None)
+
+    context.user_data["custom_credit_deduction"] = owner_id
+
+
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "✏️ Custom Credit Deduction\n\n"
+            "Enter the amount to deduct.\n\n"
+            "Examples:\n"
+            "11\n"
+            "16\n"
+            "$17"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel",
+                        callback_data=f"creditplayer:{owner_id}",
+                    )
+                ]
+            ]
+        ),
+    )
 
 async def remind_all_button(
     update: Update,
@@ -3104,7 +3464,147 @@ async def create_game_message_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if context.user_data.get(
+        "custom_credit_deduction"
+    ) is not None:
+        if not is_bot_admin(
+            update.effective_user.id
+        ):
+            return
 
+        owner_id = context.user_data[
+            "custom_credit_deduction"
+        ]
+
+        text = (
+            update.message.text
+            .replace("$", "")
+            .strip()
+        )
+
+        try:
+            amount = float(text)
+
+            if amount <= 0:
+                raise ValueError
+
+            amount_cents = round(
+                amount * 100
+            )
+
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Please enter a valid amount."
+            )
+            return
+
+        conn = get_db()
+
+        account = conn.execute(
+            """
+            SELECT
+                owner_name,
+                balance_cents
+            FROM credit_accounts
+            WHERE owner_id = ?
+            """,
+            (owner_id,),
+        ).fetchone()
+
+        if account is None:
+            conn.close()
+
+            context.user_data.pop(
+                "custom_credit_deduction",
+                None,
+            )
+
+            await update.message.reply_text(
+                "❌ Credit account not found."
+            )
+            return
+
+        if amount_cents > account["balance_cents"]:
+            conn.close()
+
+            await update.message.reply_text(
+                (
+                    "❌ That is more than the "
+                    "player's current credit.\n\n"
+                   f"Current balance: "
+                    f"${account['balance_cents'] / 100:.2f}"
+                )
+            )
+            return
+    
+        conn.execute(
+            """
+            UPDATE credit_accounts
+            SET balance_cents =
+                balance_cents - ?
+            WHERE owner_id = ?
+            """,
+            (
+                amount_cents,
+                owner_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO credit_transactions (
+                owner_id,
+                amount_cents,
+                transaction_type,
+                description
+            )
+            VALUES (?, ?, 'manual_deduction', ?)
+            """,
+            (
+                owner_id,
+                -amount_cents,
+                (
+                    f"Manual credit deduction "
+                    f"by admin "
+                    f"{update.effective_user.full_name}"
+                ),
+            ),
+        )
+
+        conn.commit()
+        conn.close()
+
+        context.user_data.pop(
+            "custom_credit_deduction",
+            None,
+        )
+
+        new_balance = get_credit_balance(
+            owner_id
+        )
+
+        await update.message.reply_text(
+            (
+                "✅ Credit deducted\n\n"
+                f"Player: {account['owner_name']}\n"
+                f"Deducted: ${amount_cents / 100:.2f}\n"
+                f"New balance: ${new_balance / 100:.2f}"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                           "💳 Back to credits",
+                           callback_data="admin_manage_credits",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+    
+    
     # =====================================================
     # CUSTOM CREDIT TOP-UP
     # =====================================================
@@ -4467,7 +4967,49 @@ async def broadcast_command(
             f"✅ Sent: {sent}\n"
             f"❌ Failed: {failed}"
         )
-    ) 
+    )
+    
+async def notify_admins_of_pullout(
+    context,
+    game,
+    removed_name,
+    removed_type,
+    old_status,
+    removed_by,
+):
+    if old_status == "player":
+        status_text = "Confirmed player"
+    else:
+        status_text = "Waitlist"
+
+    if removed_type == "self":
+        type_text = "Own spot"
+    else:
+        type_text = "+1"
+
+    text = (
+        "🚨 Player pulled out\n\n"
+        f"👤 Account: {removed_by}\n"
+        f"🏸 Removed: {removed_name}\n"
+        f"👥 Type: {type_text}\n"
+        f"📋 Was: {status_text}\n\n"
+        f"📅 {game['date']}\n"
+        f"⏰ {game['time']}\n"
+        f"📍 {game['location']}"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+            )
+        except Exception as e:
+            print(
+                f"Could not notify admin "
+                f"{admin_id} about pullout: {e}",
+                flush=True,
+            ) 
 # =========================================================
 # BUTTON HANDLER
 # =========================================================
@@ -4755,6 +5297,15 @@ async def button_handler(
                 game_id,
             )
 
+        await notify_admins_of_pullout(
+            context=context,
+            game=game,
+            removed_name=entry["name"],
+            removed_type="self",
+            old_status=old_status,
+            removed_by=user_name,
+        )
+
         await query.answer(
             "✅ You have been removed."
         )
@@ -4841,6 +5392,15 @@ async def button_handler(
             promoted = promote_waitlist(
                 game_id,
             )
+
+        await notify_admins_of_pullout(
+            context=context,
+            game=game,
+            removed_name=guest["name"],
+            removed_type="guest",
+            old_status=old_status,
+            removed_by=user_name,
+        )
 
         renumber_guests(
             game_id,
@@ -5261,6 +5821,34 @@ def main():
         CallbackQueryHandler(
             debt_pay_selected_button,
             pattern=r"^debtpayselected:\d+$",
+        )
+    )
+    
+    app.add_handler(
+    CallbackQueryHandler(
+        admin_manage_credits_button,
+        pattern=r"^admin_manage_credits$",
+    )
+)
+
+    app.add_handler(
+        CallbackQueryHandler(
+            credit_player_button,
+            pattern=r"^creditplayer:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            credit_deduct_button,
+            pattern=r"^creditdeduct:\d+:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            credit_deduct_custom_button,
+            pattern=r"^creditdeductcustom:\d+$",
         )
     )
 
