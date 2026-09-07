@@ -4933,7 +4933,7 @@ async def topup_approve_button(
                 "✅ Your Baddy Buddies top-up "
                 "has been approved!\n\n"
                 f"Top-up: ${amount:.2f}\n"
-                f"🧾 Applied to outstanding balance: "
+                f"🧾 Applied to balance: "
                 f"${debt_paid_cents / 100:.2f}\n"
                 f"💳 Added to credit: "
                 f"${credit_added_cents / 100:.2f}\n"
