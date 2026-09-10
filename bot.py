@@ -6542,10 +6542,16 @@ def main():
 
     print("🏸 Baddy Buddies is running...")
 
-    app.job_queue.run_once(
+    app.job_queue.run_daily(
         send_game_reminders,
-        when=10,
-        name="game_reminders_test",
+        time=dt_time(
+            hour=19,
+            minute=0,
+            tzinfo=ZoneInfo(
+                "Asia/Singapore"
+            ),
+        ),
+        name="game_reminders",
     )
     app.run_polling()
 
