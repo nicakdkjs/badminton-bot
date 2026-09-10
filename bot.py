@@ -3,7 +3,7 @@ import sqlite3
 import time
 from telegram.error import BadRequest
 
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 
@@ -158,6 +158,7 @@ def setup_database():
         """
     )
     
+    
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS bot_users (
@@ -168,7 +169,65 @@ def setup_database():
             last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
-)
+    )
+
+    # Add reminder preference to bot_users if it
+    # does not already exist.
+    columns = conn.execute(
+        "PRAGMA table_info(bot_users)"
+    ).fetchall()
+
+    column_names = {
+        column["name"]
+        for column in columns
+    }
+
+    if "game_reminders" not in column_names:
+        conn.execute(
+            """
+            ALTER TABLE bot_users
+            ADD COLUMN game_reminders
+            INTEGER NOT NULL DEFAULT 0
+            """
+        )
+
+    # Track reminders already sent so the same
+    # game is never reminded twice.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_reminders_sent (
+            game_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+            PRIMARY KEY (
+                game_id,
+                owner_id
+            ),
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    game_columns = conn.execute(
+        "PRAGMA table_info(games)"
+    ).fetchall()
+
+    game_column_names = {
+        column["name"]
+        for column in game_columns
+    }
+
+    if "game_date_iso" not in game_column_names:
+        conn.execute(
+            """
+            ALTER TABLE games
+            ADD COLUMN game_date_iso TEXT
+            """
+        )
 
     conn.commit()
     conn.close()
@@ -622,6 +681,12 @@ def make_main_menu(user_id):
         ],
         [
             InlineKeyboardButton(
+                "🔔 Game reminders",
+                callback_data="menu_reminders",
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "💳 My credits",
                 callback_data="menu_credit",
             )
@@ -700,7 +765,25 @@ def make_upcoming_games_keyboard(games):
 
     return InlineKeyboardMarkup(buttons)
 
+def get_game_reminder_setting(user_id):
+    conn = get_db()
 
+    row = conn.execute(
+        """
+        SELECT game_reminders
+        FROM bot_users
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if row is None:
+        return False
+
+    return bool(row["game_reminders"])
+    
 def get_game_message_url(game):
     chat_id = str(game["chat_id"])
     message_id = game["message_id"]
@@ -1273,6 +1356,7 @@ async def remind_all_button(
 
     sent = 0
     failed = 0
+    failed_players = []
 
     for owner_id, person in people.items():
 
@@ -1326,16 +1410,45 @@ async def remind_all_button(
         except Exception as e:
             print(
                 f"Could not remind "
-                f"{person['name']} ({owner_id}): {e}"
+                f"{person['name']} ({owner_id}): {e}",
+                flush=True,
             )
 
             failed += 1
 
+            failed_players.append(
+                f"{person['name']} ({owner_id})"
+            )
+
+    # Show result only AFTER all players
+    # have been processed.
+    if failed_players:
+        failed_text = "\n".join(
+            f"• {player}"
+            for player in failed_players
+        )
+
+        message = (
+            "🔔 Reminders complete\n\n"
+            f"✅ Sent: {sent}\n"
+            f"❌ Unable to DM: {failed}\n\n"
+            "Could not message:\n"
+            f"{failed_text}"
+        )
+
+    else:
+        message = (
+            "🔔 Reminders complete\n\n"
+            f"✅ Sent: {sent}\n"
+            "❌ Unable to DM: 0"
+        )
+
     await query.answer(
-        f"🔔 Sent: {sent} | Unable to DM: {failed}",
+        message,
         show_alert=True,
     )
- 
+    
+    
 def make_cancel_game_keyboard(games):
     buttons = []
 
@@ -1821,95 +1934,56 @@ async def create_game(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    text = update.message.text.partition(" ")[2]
-
-    parts = [
-        x.strip()
-        for x in text.split("|")
-    ]
-
-    if len(parts) != 8:
+    if not is_bot_admin(
+        update.effective_user.id
+    ):
         await update.message.reply_text(
-            "Use:\n\n"
-            "/game MAX | DATE | TIME | LOCATION | "
-            "COURTS | PRICE | LEVEL | SHUTTLE\n\n"
-            "Example:\n"
-            "/game 8 | 26th Aug Wednesday | 9-11 PM | "
-            "The Sports Arena (Jalan Kayu) | "
-            "2 courts (C3,4) | 16 | HB-LI | RSL Ultimate"
+            "❌ You are not authorised to create games."
         )
         return
 
-    try:
-        maximum = int(parts[0])
-    except ValueError:
-        await update.message.reply_text(
-            "Maximum players must be a number."
-        )
-        return
+    # Clear any other text-input workflows
+    context.user_data.pop(
+        "custom_topup",
+        None,
+    )
+    context.user_data.pop(
+        "custom_credit_deduction",
+        None,
+    )
+    context.user_data.pop(
+        "editing_game",
+        None,
+    )
+    context.user_data.pop(
+        "edit_game_id",
+        None,
+    )
+    context.user_data.pop(
+        "edit_field",
+        None,
+    )
 
-    conn = get_db()
+    # Start guided game creation
+    context.user_data[
+        "creating_game"
+    ] = True
 
-    cursor = conn.execute(
-        """
-        INSERT INTO games (
-            date,
-            time,
-            location,
-            courts,
-            price,
-            level,
-            shuttle,
-            max_players
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+    context.user_data[
+        "create_game_step"
+    ] = 0
+
+    context.user_data[
+        "create_game_data"
+    ] = {}
+
+    await update.message.reply_text(
         (
-            parts[1],
-            parts[2],
-            parts[3],
-            parts[4],
-            parts[5],
-            parts[6],
-            parts[7],
-            maximum,
-        ),
+            "➕ Create Game\n\n"
+            "How many players maximum?\n\n"
+            "Example: 8"
+        )
     )
-
-    game_id = cursor.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    game = get_game(game_id)
-
-    sent_message = await update.message.reply_text(
-        make_game_text(
-            game,
-            [],
-            [],
-        ),
-        reply_markup=make_keyboard(game_id),
-    )
-
-    conn = get_db()
-
-    conn.execute(
-        """
-        UPDATE games
-        SET chat_id = ?,
-            message_id = ?
-        WHERE id = ?
-        """,
-        (
-            sent_message.chat_id,
-            sent_message.message_id,
-            game_id,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
     
 async def create_game_cancel_button(
     update: Update,
@@ -2400,6 +2474,232 @@ async def menu_button(
 
         return
 
+async def send_game_reminders(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    singapore = ZoneInfo(
+        "Asia/Singapore"
+    )
+
+    now = datetime.now(
+        singapore
+    )
+
+    tomorrow = (
+        now.date()
+        + timedelta(days=1)
+    ).isoformat()
+
+    conn = get_db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            games.id AS game_id,
+            games.date,
+            games.time,
+            games.location,
+            games.courts,
+            games.price,
+
+            entries.owner_id,
+            entries.owner_name,
+
+            COUNT(entries.id) AS spots
+
+        FROM games
+
+        JOIN entries
+            ON entries.game_id = games.id
+
+        JOIN bot_users
+            ON bot_users.user_id =
+               entries.owner_id
+
+        LEFT JOIN game_reminders_sent
+            ON game_reminders_sent.game_id =
+               games.id
+           AND game_reminders_sent.owner_id =
+               entries.owner_id
+
+        WHERE games.finished = 0
+          AND games.game_date_iso = ?
+          AND entries.status = 'player'
+          AND bot_users.game_reminders = 1
+          AND game_reminders_sent.owner_id IS NULL
+
+        GROUP BY
+            games.id,
+            entries.owner_id
+
+        ORDER BY
+            games.id,
+            entries.owner_id
+        """,
+        (tomorrow,),
+    ).fetchall()
+
+    conn.close()
+
+    for row in rows:
+        try:
+            if row["spots"] == 1:
+                spot_text = ""
+            else:
+                spot_text = (
+                    f"\n👥 You have "
+                    f"{row['spots']} spots booked"
+                )
+
+            await context.bot.send_message(
+                chat_id=row["owner_id"],
+                text=(
+                    "🏸 Game reminder\n\n"
+                    "You have badminton tomorrow!\n\n"
+                    f"📅 {row['date']}\n"
+                    f"⏰ {row['time']}\n"
+                    f"📍 {row['location']}\n"
+                    f"🏸 {row['courts']}\n"
+                    f"💰 ${row['price']}/pax"
+                    f"{spot_text}\n\n"
+                    "See you tomorrow! 🏸"
+                ),
+            )
+
+            conn = get_db()
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO
+                    game_reminders_sent (
+                        game_id,
+                        owner_id
+                    )
+                VALUES (?, ?)
+                """,
+                (
+                    row["game_id"],
+                    row["owner_id"],
+                ),
+            )
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(
+                f"Could not send game reminder "
+                f"to {row['owner_name']} "
+                f"({row['owner_id']}): {e}",
+                flush=True,
+            )
+            
+async def reminder_menu_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    enabled = get_game_reminder_setting(
+        user_id
+    )
+
+    if enabled:
+        status = "✅ ON"
+        button_text = "🔕 Turn reminders off"
+        callback_data = "reminders_off"
+    else:
+        status = "❌ OFF"
+        button_text = "🔔 Turn reminders on"
+        callback_data = "reminders_on"
+
+    await query.answer()
+
+    await query.edit_message_text(
+        (
+            "🔔 Game Reminders\n\n"
+            f"Current setting: {status}\n\n"
+            "When enabled, I'll send you a "
+            "private reminder one day before "
+            "each game you're confirmed for."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        button_text,
+                        callback_data=callback_data,
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="menu_home",
+                    )
+                ],
+            ]
+        ),
+    )
+    
+async def reminder_toggle_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    enabled = (
+        query.data == "reminders_on"
+    )
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE bot_users
+        SET game_reminders = ?
+        WHERE user_id = ?
+        """,
+        (
+            1 if enabled else 0,
+            user_id,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    if enabled:
+        text = (
+            "✅ Game reminders turned on.\n\n"
+            "You'll receive a private reminder "
+            "one day before games you're "
+            "confirmed for."
+        )
+    else:
+        text = (
+            "🔕 Game reminders turned off.\n\n"
+            "You won't receive automatic "
+            "game reminders."
+        )
+
+    await query.answer()
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to menu",
+                        callback_data="menu_home",
+                    )
+                ]
+            ]
+        ),
+    )
+    
 async def debts_by_player_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3757,7 +4057,42 @@ async def create_game_message_handler(
 
         if not game_id or not field:
             return
+            
+        if field == "date":
+            try:
+                game_date = datetime.strptime(
+                    new_value,
+                    "%Y-%m-%d",
+                ).date()
 
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Please enter the date as YYYY-MM-DD.\n\n"
+                    "Example: 2026-09-12"
+                )
+                return
+
+            game_date_iso = game_date.isoformat()
+
+            day = game_date.day
+
+            if 10 <= day % 100 <= 20:
+                suffix = "th"
+            else:
+                suffix = {
+                    1: "st",
+                    2: "nd",
+                    3: "rd",
+                }.get(
+                    day % 10,
+                    "th",
+                )
+
+            new_value = (
+                f"{day}{suffix} "
+                f"{game_date.strftime('%b %A')}"
+        )
+    
         if field == "max_players":
             try:
                 new_value = int(new_value)
@@ -3806,17 +4141,33 @@ async def create_game_message_handler(
 
         conn = get_db()
 
-        conn.execute(
-            f"""
-            UPDATE games
-            SET {field} = ?
-            WHERE id = ?
-            """,
-            (
-                new_value,
-                game_id,
-            ),
-        )
+        if field == "date":
+            conn.execute(
+                """
+                UPDATE games
+                SET date = ?,
+                    game_date_iso = ?
+                WHERE id = ?
+                """,
+                (
+                    new_value,
+                    game_date_iso,
+                    game_id,
+                ),
+            )
+        
+        else:
+            conn.execute(
+                f"""
+                UPDATE games
+                SET {field} = ?
+                WHERE id = ?
+                """,
+                (
+                    new_value,
+                    game_id,
+                ),
+            )
 
         conn.commit()
         conn.close()
@@ -3929,6 +4280,42 @@ async def create_game_message_handler(
 
         data["max_players"] = maximum
 
+    elif step == "date":
+        try:
+            game_date = datetime.strptime(
+                text,
+                "%Y-%m-%d",
+            ).date()
+
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Please enter the date as YYYY-MM-DD.\n\n"
+                "Example: 2026-09-12"
+            )
+            return
+
+        data["game_date_iso"] = game_date.isoformat()
+
+        # Nice human-readable date for Telegram
+        day = game_date.day
+
+        if 10 <= day % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {
+                1: "st",
+                2: "nd",
+                3: "rd",
+            }.get(
+                day % 10,
+                "th",
+            )
+
+        data["date"] = (
+            f"{day}{suffix} "
+            f"{game_date.strftime('%b %A')}"
+        )
+
     else:
         data[step] = text
 
@@ -3972,7 +4359,8 @@ async def create_game_message_handler(
     prompts = {
         "date": (
             "📅 What is the date?\n\n"
-            "Example: 26th Aug Wednesday"
+            "Enter as YYYY-MM-DD.\n"
+            "Example: 2026-09-12"
         ),
         "time": (
             "⏰ What time is the game?\n\n"
@@ -3980,7 +4368,7 @@ async def create_game_message_handler(
         ),
         "location": (
             "📍 Where is the game?\n\n"
-            "Example: The Sports Arena "
+            "Example: The Sports Arina "
             "(Jalan Kayu)"
         ),
         "courts": (
@@ -4042,6 +4430,7 @@ async def create_game_confirm_button(
         """
         INSERT INTO games (
             date,
+            game_date_iso,
             time,
             location,
             courts,
@@ -4050,10 +4439,11 @@ async def create_game_confirm_button(
             shuttle,
             max_players
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             data["date"],
+            data["game_date_iso"],
             data["time"],
             data["location"],
             data["courts"],
@@ -4527,12 +4917,20 @@ async def edit_field_button(
 
     await query.answer()
 
+    if field == "date":
+        instruction = (
+            "Send the new date as YYYY-MM-DD.\n"
+            "Example: 2026-09-12"
+        )
+    else:
+        instruction = "Send the new value:"
+
     await query.edit_message_text(
         (
             f"✏️ Editing {labels[field]}\n\n"
             f"Current value:\n"
             f"{game[field]}\n\n"
-            "Send the new value:"
+            f"{instruction}"
         )
     )
     
@@ -6103,9 +6501,34 @@ def main():
             pattern=r"^creditdeductcustom:\d+$",
         )
     )
+    
+    app.add_handler(
+        CallbackQueryHandler(
+            reminder_menu_button,
+            pattern=r"^menu_reminders$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            reminder_toggle_button,
+            pattern=r"^(reminders_on|reminders_off)$",
+        )
+    )
 
     print("🏸 Baddy Buddies is running...")
 
+    app.job_queue.run_daily(
+        send_game_reminders,
+        time=dt_time(
+            hour=19,
+            minute=0,
+            tzinfo=ZoneInfo(
+                "Asia/Singapore"
+            ),
+        ),
+        name="game_reminders",
+    )
     app.run_polling()
 
 
