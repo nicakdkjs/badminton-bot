@@ -3816,6 +3816,28 @@ async def admin_create_game_button(
         )
         return
 
+    # Clear other text-input workflows
+    context.user_data.pop(
+        "custom_topup",
+        None,
+    )
+    context.user_data.pop(
+        "custom_credit_deduction",
+        None,
+    )
+    context.user_data.pop(
+        "editing_game",
+        None,
+    )
+    context.user_data.pop(
+        "edit_game_id",
+        None,
+    )
+    context.user_data.pop(
+        "edit_field",
+        None,
+    )
+
     context.user_data["creating_game"] = True
     context.user_data["create_game_step"] = 0
     context.user_data["create_game_data"] = {}
@@ -3823,9 +3845,11 @@ async def admin_create_game_button(
     await query.answer()
 
     await query.edit_message_text(
-        "➕ Create Game\n\n"
-        "How many players maximum?\n\n"
-        "Example: 8"
+        (
+            "➕ Create Game\n\n"
+            "How many players maximum?\n\n"
+            "Example: 8"
+        )
     )
     
 async def create_game_message_handler(
